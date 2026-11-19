@@ -1,0 +1,178 @@
+name: Release an interpreter
+
+# Tag `python-<version>` (a version listed in versions.toml) to build it,
+# attach it to a GitHub Release and add it to the signed registry index.
+# Run it by hand to build and test a version without releasing anything.
+on:
+  push:
+    tags: ['python-*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'A version from versions.toml, e.g. 3.13.18 (builds and tests only)'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  ARCH: x86_64
+  REGISTRY_REPO: homeCore-io/registry
+  INDEX_URL: https://homecore-io.github.io/registry/index.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.which.outputs.version }}
+      upstream: ${{ steps.which.outputs.upstream }}
+      eol: ${{ steps.which.outputs.eol }}
+      abi: ${{ steps.build.outputs.abi }}
+      file: ${{ steps.build.outputs.file }}
+      sha256: ${{ steps.build.outputs.sha256 }}
+      size: ${{ steps.build.outputs.size }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Which version
+        id: which
+        env:
+          INPUT: ${{ inputs.version }}
+          REF: ${{ github.ref_name }}
+          EV: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EV" = "push" ]; then version="${REF#python-}"; else version="$INPUT"; fi
+          python3 - "$version" >> "$GITHUB_OUTPUT" <<'PY'
+          import sys, tomllib
+          version = sys.argv[1]
+          minor = ".".join(version.split(".")[:2])
+          entries = tomllib.load(open("versions.toml", "rb"))["python"]
+          entry = entries.get(minor)
+          if entry is None or entry["version"] != version:
+              listed = ", ".join(e["version"] for e in entries.values())
+              sys.exit(f"::error::{version} is not in versions.toml (it lists {listed}). Merge it there first.")
+          print(f"version={version}")
+          print(f"upstream={entry['upstream']}")
+          print(f"eol={'true' if entry.get('eol') else 'false'}")
+          PY
+
+      - name: Build
+        id: build
+        run: |
+          set -euo pipefail
+          ./build-python.sh --version "${{ steps.which.outputs.version }}" \
+            --upstream "${{ steps.which.outputs.upstream }}" --arch "$ARCH" --out dist
+          cat dist/*.meta >> "$GITHUB_OUTPUT"
+
+      # The build already proved the standard library is whole. This proves the
+      # way a runtime uses it: uv makes a venv on the unpacked interpreter and
+      # compiled wheels for its ABI load in it.
+      - uses: astral-sh/setup-uv@v7
+      - name: Install compiled wheels into it
+        run: |
+          set -euo pipefail
+          mkdir -p check
+          tar --zstd -xf "dist/${{ steps.build.outputs.file }}" -C check
+          UV_PYTHON_DOWNLOADS=never uv venv -q --python check/python/bin/python3 check/env
+          uv pip install -q --python check/env/bin/python --only-binary=:all: \
+            pydantic-core jiter rpds-py cffi cryptography websockets
+          check/env/bin/python -c "
+          import sys, pydantic_core, jiter, rpds, cffi, websockets
+          from cryptography.hazmat.primitives import hashes
+          print(sys.version.split()[0], 'loads compiled wheels')"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: interpreter
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: interpreter
+          path: dist
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          UPSTREAM: ${{ needs.build.outputs.upstream }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          SIZE: ${{ needs.build.outputs.size }}
+        run: |
+          {
+            echo "Python ${VERSION} for homeCore plugin runtimes, linux ${ARCH}."
+            echo
+            echo "Built from python-build-standalone [${UPSTREAM}](https://github.com/astral-sh/python-build-standalone/releases/tag/${UPSTREAM}) (install_only_stripped), with the test suite, Tk, ensurepip and libpython removed."
+            echo
+            echo "- sha256: \`${SHA256}\`"
+            echo "- size: $(( SIZE / 1024 / 1024 )) MB"
+          } > notes.md
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.tar.zst
+          body_path: notes.md
+
+      - name: Publish to the registry
+        env:
+          GH_TOKEN: ${{ secrets.REGISTRY_DISPATCH_PAT }}
+          VERSION: ${{ needs.build.outputs.version }}
+          ABI: ${{ needs.build.outputs.abi }}
+          FILE: ${{ needs.build.outputs.file }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+          SIZE: ${{ needs.build.outputs.size }}
+          UPSTREAM: ${{ needs.build.outputs.upstream }}
+          EOL: ${{ needs.build.outputs.eol }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::REGISTRY_DISPATCH_PAT is not available to this repository, so Python ${VERSION} is released but NOT in the registry. Give the repository access to the secret and re-run this job."
+            exit 1
+          fi
+          url="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/${FILE}"
+          gh api "repos/${REGISTRY_REPO}/dispatches" \
+            -f event_type=publish-interpreter \
+            -F "client_payload[kind]=python" \
+            -F "client_payload[version]=${VERSION}" \
+            -F "client_payload[abi]=${ABI}" \
+            -F "client_payload[os]=linux" \
+            -F "client_payload[arch]=${ARCH}" \
+            -F "client_payload[url]=${url}" \
+            -F "client_payload[sha256]=${SHA256}" \
+            -F "client_payload[size]=${SIZE}" \
+            -F "client_payload[upstream]=${UPSTREAM}" \
+            -F "client_payload[eol]=${EOL}"
+          echo "Asked ${REGISTRY_REPO} to index Python ${VERSION} (${ARCH})"
+
+      # The dispatch only says a message was sent. This waits for the served
+      # index to carry the entry.
+      - name: Verify it reached the registry index
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
+        run: |
+          set -uo pipefail
+          deadline=$(( SECONDS + 600 ))
+          attempt=0
+          while :; do
+            attempt=$(( attempt + 1 ))
+            found="$(curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' \
+                "${INDEX_URL}?cb=${GITHUB_RUN_ID}-${attempt}" 2>/dev/null \
+              | jq -r --arg v "$VERSION" --arg arch "$ARCH" --arg sha "$SHA256" \
+                '[.interpreters[]? | select(.kind == "python" and .version == $v and .arch == $arch and .sha256 == $sha)] | length' 2>/dev/null)"
+            if [ "${found:-0}" -ge 1 ]; then
+              echo "Python ${VERSION} is in the served index after ${attempt} attempt(s)."
+              exit 0
+            fi
+            if [ $SECONDS -ge $deadline ]; then
+              echo "::error::Python ${VERSION} never appeared in ${INDEX_URL}. The release exists but runtimes cannot get it."
+              exit 1
+            fi
+            sleep 15
+          done

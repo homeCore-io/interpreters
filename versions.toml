@@ -1,0 +1,25 @@
+# The interpreters homeCore ships, one per supported Python minor.
+#
+# `version` is the patch release built for that minor, and `upstream` the
+# python-build-standalone release it comes from
+# (https://github.com/astral-sh/python-build-standalone/releases). Tagging
+# `python-<version>` builds and publishes it; the weekly check opens a pull
+# request here when upstream has a newer patch.
+#
+# `eol = true` marks a minor Python no longer fixes. Plugins built for it keep
+# running and the Catalog says they need a rebuild.
+
+[python."3.12"]
+version  = "3.12.16"
+upstream = "20261110"
+eol      = false
+
+[python."3.13"]
+version  = "3.13.18"
+upstream = "20261110"
+eol      = false
+
+[python."3.14"]
+version  = "3.14.10"
+upstream = "20261110"
+eol      = false
