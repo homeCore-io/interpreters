@@ -68,7 +68,7 @@ jobs:
       # The build already proved the standard library is whole. This proves the
       # way a runtime uses it: uv makes a venv on the unpacked interpreter and
       # compiled wheels for its ABI load in it.
-      - uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v10.4.0
       - name: Install compiled wheels into it
         run: |
           set -euo pipefail
@@ -82,7 +82,7 @@ jobs:
           from cryptography.hazmat.primitives import hashes
           print(sys.version.split()[0], 'loads compiled wheels')"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: interpreter
           path: dist/*
@@ -93,7 +93,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v8
         with:
           name: interpreter
           path: dist
