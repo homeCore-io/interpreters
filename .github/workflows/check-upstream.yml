@@ -1,7 +1,8 @@
 name: Check upstream for new patches
 
 # Once a week, compare versions.toml with python-build-standalone's latest
-# release, and open a pull request when a supported minor has a newer patch.
+# release and nodejs.org's releases, and open a pull request when a supported
+# Python minor or Node.js major has a newer patch.
 # Merging it changes nothing anyone runs; tagging each listed version releases
 # it, and houses then see it in Updates.
 on:
@@ -44,10 +45,10 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$branch"
-          git commit -qam "Newer Python patches: $TAGS"
+          git commit -qam "Newer interpreter patches: $TAGS"
           git push -q origin "$branch"
           {
-            echo "python-build-standalone has newer patches for the minors homeCore supports."
+            echo "Upstream has newer patches for the interpreters homeCore supports."
             echo
             echo '```'
             grep -v '^tags: ' check.txt
@@ -59,4 +60,4 @@ jobs:
             for t in $TAGS; do echo "git tag $t && git push origin $t"; done
             echo '```'
           } > body.md
-          gh pr create --title "Newer Python patches: $TAGS" --body-file body.md --base main --head "$branch"
+          gh pr create --title "Newer interpreter patches: $TAGS" --body-file body.md --base main --head "$branch"

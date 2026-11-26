@@ -1,79 +1,106 @@
 name: Release an interpreter
 
-# Tag `python-<version>` (a version listed in versions.toml) to build it,
-# attach it to a GitHub Release and add it to the signed registry index.
-# Run it by hand to build and test a version without releasing anything.
+# Tag `python-<version>` or `node-<version>` (a version listed in
+# versions.toml) to build it, attach it to a GitHub Release and add it to the
+# signed registry index. Run it by hand to build and test a version without
+# releasing anything.
+#
+# Python is built for x86_64, which is what its runtime image runs on. Node is
+# built for x86_64 and aarch64, each on a runner of that architecture so the
+# build's checks run the binary they ship.
 on:
   push:
-    tags: ['python-*']
+    tags: ['python-*', 'node-*']
   workflow_dispatch:
     inputs:
-      version:
-        description: 'A version from versions.toml, e.g. 3.13.18 (builds and tests only)'
+      tag:
+        description: 'What to build, as its tag would name it, e.g. python-3.13.18 or node-24.22.3 (builds and tests only)'
         required: true
 
 permissions:
   contents: write
 
 env:
-  ARCH: x86_64
   REGISTRY_REPO: homeCore-io/registry
   INDEX_URL: https://homecore-io.github.io/registry/index.json
 
 jobs:
-  build:
+  which:
     runs-on: ubuntu-latest
     outputs:
+      kind: ${{ steps.which.outputs.kind }}
       version: ${{ steps.which.outputs.version }}
       upstream: ${{ steps.which.outputs.upstream }}
       eol: ${{ steps.which.outputs.eol }}
-      abi: ${{ steps.build.outputs.abi }}
-      file: ${{ steps.build.outputs.file }}
-      sha256: ${{ steps.build.outputs.sha256 }}
-      size: ${{ steps.build.outputs.size }}
+      matrix: ${{ steps.which.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
 
-      - name: Which version
+      - name: Which interpreter
         id: which
         env:
-          INPUT: ${{ inputs.version }}
+          INPUT: ${{ inputs.tag }}
           REF: ${{ github.ref_name }}
           EV: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          if [ "$EV" = "push" ]; then version="${REF#python-}"; else version="$INPUT"; fi
-          python3 - "$version" >> "$GITHUB_OUTPUT" <<'PY'
-          import sys, tomllib
-          version = sys.argv[1]
-          minor = ".".join(version.split(".")[:2])
-          entries = tomllib.load(open("versions.toml", "rb"))["python"]
-          entry = entries.get(minor)
+          if [ "$EV" = "push" ]; then tag="$REF"; else tag="$INPUT"; fi
+          python3 - "$tag" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys, tomllib
+          tag = sys.argv[1]
+          kind, _, version = tag.partition("-")
+          entries = tomllib.load(open("versions.toml", "rb")).get(kind)
+          if not entries or not version:
+              sys.exit(f"::error::{tag} is not python-<version> or node-<version>")
+          # Python is listed by minor (3.13), Node by major (24).
+          series = ".".join(version.split(".")[: 2 if kind == "python" else 1])
+          entry = entries.get(series)
           if entry is None or entry["version"] != version:
               listed = ", ".join(e["version"] for e in entries.values())
-              sys.exit(f"::error::{version} is not in versions.toml (it lists {listed}). Merge it there first.")
+              sys.exit(f"::error::{version} is not in versions.toml's {kind} (it lists {listed}). Merge it there first.")
+          runners = {"x86_64": "ubuntu-latest", "aarch64": "ubuntu-24.04-arm"}
+          arches = ["x86_64"] if kind == "python" else ["x86_64", "aarch64"]
+          print(f"kind={kind}")
           print(f"version={version}")
-          print(f"upstream={entry['upstream']}")
+          print(f"upstream={entry.get('upstream', '')}")
           print(f"eol={'true' if entry.get('eol') else 'false'}")
+          print("matrix=" + json.dumps({"include": [{"arch": a, "runner": runners[a]} for a in arches]}))
           PY
 
+  build:
+    needs: which
+    strategy:
+      matrix: ${{ fromJson(needs.which.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      KIND: ${{ needs.which.outputs.kind }}
+      VERSION: ${{ needs.which.outputs.version }}
+      UPSTREAM: ${{ needs.which.outputs.upstream }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7
+
       - name: Build
-        id: build
         run: |
           set -euo pipefail
-          ./build-python.sh --version "${{ steps.which.outputs.version }}" \
-            --upstream "${{ steps.which.outputs.upstream }}" --arch "$ARCH" --out dist
-          cat dist/*.meta >> "$GITHUB_OUTPUT"
+          if [ "$KIND" = python ]; then
+            ./build-python.sh --version "$VERSION" --upstream "$UPSTREAM" --arch "$ARCH" --out dist
+          else
+            ./build-node.sh --version "$VERSION" --arch "$ARCH" --out dist
+          fi
 
       # The build already proved the standard library is whole. This proves the
       # way a runtime uses it: uv makes a venv on the unpacked interpreter and
       # compiled wheels for its ABI load in it.
       - uses: astral-sh/setup-uv@v10.4.0
+        if: env.KIND == 'python'
       - name: Install compiled wheels into it
+        if: env.KIND == 'python'
         run: |
           set -euo pipefail
+          . dist/*.meta
           mkdir -p check
-          tar --zstd -xf "dist/${{ steps.build.outputs.file }}" -C check
+          tar --zstd -xf "dist/$file" -C check
           UV_PYTHON_DOWNLOADS=never uv venv -q --python check/python/bin/python3 check/env
           uv pip install -q --python check/env/bin/python --only-binary=:all: \
             pydantic-core jiter rpds-py cffi cryptography websockets
@@ -82,36 +109,61 @@ jobs:
           from cryptography.hazmat.primitives import hashes
           print(sys.version.split()[0], 'loads compiled wheels')"
 
+      # The way a runtime runs it: unpacked anywhere, launched by path, loading
+      # a plugin's own node_modules beside it.
+      - name: Run a plugin-shaped program on it
+        if: env.KIND == 'node'
+        run: |
+          set -euo pipefail
+          . dist/*.meta
+          mkdir -p check/app/node_modules/hello
+          tar --zstd -xf "dist/$file" -C check
+          echo 'module.exports = () => "hello"' > check/app/node_modules/hello/index.js
+          echo 'const h = require("hello"); console.log(h(), process.version, process.argv[2]);' > check/app/index.js
+          out="$(check/node/bin/node check/app/index.js /config.toml)"
+          echo "$out"
+          [ "$out" = "hello v$VERSION /config.toml" ]
+
       - uses: actions/upload-artifact@v7
         with:
-          name: interpreter
+          name: interpreter-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [which, build]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    env:
+      KIND: ${{ needs.which.outputs.kind }}
+      VERSION: ${{ needs.which.outputs.version }}
+      UPSTREAM: ${{ needs.which.outputs.upstream }}
+      EOL: ${{ needs.which.outputs.eol }}
     steps:
       - uses: actions/download-artifact@v8
         with:
-          name: interpreter
+          pattern: interpreter-*
+          merge-multiple: true
           path: dist
 
       - name: Release notes
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-          UPSTREAM: ${{ needs.build.outputs.upstream }}
-          SHA256: ${{ needs.build.outputs.sha256 }}
-          SIZE: ${{ needs.build.outputs.size }}
         run: |
+          set -euo pipefail
           {
-            echo "Python ${VERSION} for homeCore plugin runtimes, linux ${ARCH}."
+            if [ "$KIND" = python ]; then
+              echo "Python ${VERSION} for homeCore plugin runtimes, linux."
+              echo
+              echo "Built from python-build-standalone [${UPSTREAM}](https://github.com/astral-sh/python-build-standalone/releases/tag/${UPSTREAM}) (install_only_stripped), with the test suite, Tk, ensurepip and libpython removed."
+            else
+              echo "Node.js ${VERSION} for homeCore plugin runtimes, linux."
+              echo
+              echo "The official [nodejs.org build](https://nodejs.org/dist/v${VERSION}/), checked against its SHASUMS256.txt, with npm, corepack, the headers and the docs removed."
+            fi
             echo
-            echo "Built from python-build-standalone [${UPSTREAM}](https://github.com/astral-sh/python-build-standalone/releases/tag/${UPSTREAM}) (install_only_stripped), with the test suite, Tk, ensurepip and libpython removed."
-            echo
-            echo "- sha256: \`${SHA256}\`"
-            echo "- size: $(( SIZE / 1024 / 1024 )) MB"
+            for m in dist/*.meta; do
+              . "$m"
+              echo "- ${arch}: sha256 \`${sha256}\`, $(( size / 1024 / 1024 )) MB"
+            done
           } > notes.md
 
       - uses: softprops/action-gh-release@v3
@@ -122,56 +174,55 @@ jobs:
       - name: Publish to the registry
         env:
           GH_TOKEN: ${{ secrets.REGISTRY_DISPATCH_PAT }}
-          VERSION: ${{ needs.build.outputs.version }}
-          ABI: ${{ needs.build.outputs.abi }}
-          FILE: ${{ needs.build.outputs.file }}
-          SHA256: ${{ needs.build.outputs.sha256 }}
-          SIZE: ${{ needs.build.outputs.size }}
-          UPSTREAM: ${{ needs.build.outputs.upstream }}
-          EOL: ${{ needs.build.outputs.eol }}
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::REGISTRY_DISPATCH_PAT is not available to this repository, so Python ${VERSION} is released but NOT in the registry. Give the repository access to the secret and re-run this job."
+            echo "::error::REGISTRY_DISPATCH_PAT is not available to this repository, so ${KIND} ${VERSION} is released but NOT in the registry. Give the repository access to the secret and re-run this job."
             exit 1
           fi
-          url="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/${FILE}"
-          gh api "repos/${REGISTRY_REPO}/dispatches" \
-            -f event_type=publish-interpreter \
-            -F "client_payload[kind]=python" \
-            -F "client_payload[version]=${VERSION}" \
-            -F "client_payload[abi]=${ABI}" \
-            -F "client_payload[os]=linux" \
-            -F "client_payload[arch]=${ARCH}" \
-            -F "client_payload[url]=${url}" \
-            -F "client_payload[sha256]=${SHA256}" \
-            -F "client_payload[size]=${SIZE}" \
-            -F "client_payload[upstream]=${UPSTREAM}" \
-            -F "client_payload[eol]=${EOL}"
-          echo "Asked ${REGISTRY_REPO} to index Python ${VERSION} (${ARCH})"
+          for m in dist/*.meta; do
+            . "$m"
+            url="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/${file}"
+            gh api "repos/${REGISTRY_REPO}/dispatches" \
+              -f event_type=publish-interpreter \
+              -F "client_payload[kind]=${KIND}" \
+              -F "client_payload[version]=${VERSION}" \
+              -F "client_payload[abi]=${abi}" \
+              -F "client_payload[os]=linux" \
+              -F "client_payload[arch]=${arch}" \
+              -F "client_payload[url]=${url}" \
+              -F "client_payload[sha256]=${sha256}" \
+              -F "client_payload[size]=${size}" \
+              -F "client_payload[upstream]=${upstream}" \
+              -F "client_payload[eol]=${EOL}"
+            echo "Asked ${REGISTRY_REPO} to index ${KIND} ${VERSION} (${arch})"
+          done
 
       # The dispatch only says a message was sent. This waits for the served
-      # index to carry the entry.
+      # index to carry every entry.
       - name: Verify it reached the registry index
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-          SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
           set -uo pipefail
           deadline=$(( SECONDS + 600 ))
           attempt=0
           while :; do
             attempt=$(( attempt + 1 ))
-            found="$(curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' \
-                "${INDEX_URL}?cb=${GITHUB_RUN_ID}-${attempt}" 2>/dev/null \
-              | jq -r --arg v "$VERSION" --arg arch "$ARCH" --arg sha "$SHA256" \
-                '[.interpreters[]? | select(.kind == "python" and .version == $v and .arch == $arch and .sha256 == $sha)] | length' 2>/dev/null)"
-            if [ "${found:-0}" -ge 1 ]; then
-              echo "Python ${VERSION} is in the served index after ${attempt} attempt(s)."
+            body="$(curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' \
+                "${INDEX_URL}?cb=${GITHUB_RUN_ID}-${attempt}" 2>/dev/null)"
+            missing=""
+            for m in dist/*.meta; do
+              . "$m"
+              found="$(printf '%s' "${body:-}" | jq -r --arg k "$KIND" --arg v "$VERSION" \
+                  --arg arch "$arch" --arg sha "$sha256" \
+                '[.interpreters[]? | select(.kind == $k and .version == $v and .arch == $arch and .sha256 == $sha)] | length' 2>/dev/null)"
+              [ "${found:-0}" -ge 1 ] || missing="$missing $arch"
+            done
+            if [ -z "$missing" ]; then
+              echo "${KIND} ${VERSION} is in the served index after ${attempt} attempt(s)."
               exit 0
             fi
             if [ $SECONDS -ge $deadline ]; then
-              echo "::error::Python ${VERSION} never appeared in ${INDEX_URL}. The release exists but runtimes cannot get it."
+              echo "::error::${KIND} ${VERSION} never appeared in ${INDEX_URL} for:${missing}. The release exists but runtimes cannot get it."
               exit 1
             fi
             sleep 15
