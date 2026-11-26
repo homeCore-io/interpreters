@@ -72,6 +72,16 @@ rm -rf "$N/lib/node_modules" "$N/bin/npm" "$N/bin/npx" "$N/bin/corepack" \
 after="$(du -sk "$N" | cut -f1)"
 note "pruned $(( (before - after) / 1024 )) MB, $(( after / 1024 )) MB left"
 
+# The shared libraries it loads must all be ones the Node runtime image
+# installs (core's docker/Dockerfile.runtime-node). Node 26 added libatomic; a
+# new one found here, not in someone's runtime, is the point.
+command -v readelf >/dev/null || die "readelf is required (binutils)"
+allowed='^(libc|libm|libdl|libpthread|librt|libstdc\+\+|libgcc_s|libatomic)\.so\.[0-9]+$|^ld-linux-(x86-64|aarch64)\.so\.[0-9]+$'
+needed="$(readelf -d "$N/bin/node" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')"
+extra="$(printf '%s\n' "$needed" | grep -Ev "$allowed" || true)"
+[ -z "$extra" ] || die "node needs libraries the runtime image doesn't install: $(echo $extra). Add them to core's docker/Dockerfile.runtime-node and to the list here"
+note "links only what the runtime image has: $(echo $needed)"
+
 # Prove it runs, is the version it claims, and has what plugins rely on: TLS,
 # compression, UDP and multicast (Matter, mDNS), workers, and full ICU.
 note "checking the result"
