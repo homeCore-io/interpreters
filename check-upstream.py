@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Move versions.toml to the newest patch python-build-standalone offers.
+"""Move versions.toml to the newest patches upstream offers.
 
     python3 check-upstream.py [--arch x86_64] [--write]
 
-Reads the latest upstream release, and for each minor in versions.toml finds
-the newest final patch built there as install_only_stripped for linux. Prints
-what would change; with --write it edits versions.toml in place, keeping its
-comments, and prints the tags to push after the change is merged.
+Python: reads python-build-standalone's latest release, and for each minor in
+versions.toml finds the newest final patch built there as install_only_stripped
+for linux. Node.js: reads nodejs.org's release list, and for each major finds
+its newest release. Prints what would change; with --write it edits
+versions.toml in place, keeping its comments, and prints the tags to push after
+the change is merged.
 
 Uses GITHUB_TOKEN when set, for the API's higher rate limit.
 """
@@ -19,6 +21,7 @@ import tomllib
 import urllib.request
 
 API = "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest"
+NODE_INDEX = "https://nodejs.org/dist/index.json"
 HERE = os.path.dirname(os.path.abspath(__file__))
 VERSIONS = os.path.join(HERE, "versions.toml")
 
@@ -53,6 +56,42 @@ def offered(release, arch):
     return by_minor
 
 
+def node_newest():
+    """The newest release of each Node.js major, from nodejs.org."""
+    with urllib.request.urlopen(NODE_INDEX, timeout=30) as resp:
+        releases = json.load(resp)
+    by_major = {}
+    for rel in releases:
+        version = rel["version"].lstrip("v")
+        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            continue
+        major = version.split(".")[0]
+        if major not in by_major or as_tuple(version) > as_tuple(by_major[major]):
+            by_major[major] = version
+    return by_major
+
+
+def check_node(current, write_text):
+    """Node.js majors with a newer release: [(major, old, new)], and the text."""
+    newest = node_newest()
+    changes = []
+    for major, entry in current.items():
+        new = newest.get(major)
+        if new and as_tuple(new) > as_tuple(entry["version"]):
+            changes.append((major, entry["version"], new))
+            print(f"node {major}: {entry['version']} -> {new}")
+        else:
+            print(f"node {major}: {entry['version']} is current")
+    for major, old, new in changes:
+        section = re.compile(
+            rf'(\[node\."{re.escape(major)}"\][^\[]*?version\s*=\s*)"{re.escape(old)}"'
+        )
+        write_text, n = section.subn(rf'\g<1>"{new}"', write_text)
+        if n != 1:
+            sys.exit(f"could not find the node {major} entry to update in versions.toml")
+    return changes, write_text
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", default="x86_64")
@@ -60,7 +99,8 @@ def main():
     args = ap.parse_args()
 
     with open(VERSIONS, "rb") as f:
-        current = tomllib.load(f)["python"]
+        listed = tomllib.load(f)
+    current = listed["python"]
     release = latest_release()
     upstream = release["tag_name"]
     available = offered(release, args.arch)
@@ -83,10 +123,12 @@ def main():
             print(f"{minor}: upstream builds it ({available[minor]}); add it here once the "
                   "compiled libraries plugins use publish wheels for it")
 
-    if not changes or not args.write:
+    text = open(VERSIONS).read()
+    node_changes, text_after_node = check_node(listed.get("node", {}), text)
+    if not (changes or node_changes) or not args.write:
         return
 
-    text = open(VERSIONS).read()
+    text = text_after_node
     for minor, old, new in changes:
         section = re.compile(
             rf'(\[python\."{re.escape(minor)}"\][^\[]*?version\s*=\s*)"{re.escape(old)}"'
@@ -97,7 +139,8 @@ def main():
             sys.exit(f"could not find the {minor} entry to update in versions.toml")
     with open(VERSIONS, "w") as f:
         f.write(text)
-    print("tags: " + " ".join(f"python-{new}" for _, _, new in changes))
+    tags = [f"python-{new}" for _, _, new in changes] + [f"node-{new}" for _, _, new in node_changes]
+    print("tags: " + " ".join(tags))
 
 
 if __name__ == "__main__":
